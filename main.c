@@ -1,10 +1,13 @@
+#include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define NEXT_IP SIGUSR1
@@ -36,16 +39,84 @@ void *parentThread() {
     printf("Scanning finished on %d.%d.%d.%d\n", buffer->ip1, buffer->ip2, buffer->ip3, buffer->ip4);
 }
 
-void scanIp(int ip1, int ip2, int ip3, int ip4, int port) {
-    printf("    knocking %d.%d.%d.%d\n", ip1, ip2, ip3, ip4);
+int connectAttempt(char addr[], int port) {
+    struct sockaddr_in address;  /* the libc network address data structure */
+    short int sock = -1;         /* file descriptor for the network socket */
+    fd_set fdset;
+    struct timeval tv;
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = inet_addr(addr); /* assign the address */
+    address.sin_port = htons(port);            /* translate int2port num */
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    connect(sock, (struct sockaddr *)&address, sizeof(address));
+
+    FD_ZERO(&fdset);
+    FD_SET(sock, &fdset);
+    tv.tv_sec = 2;             /* 10 second timeout */
+    tv.tv_usec = 0;
+
+    if (select(sock + 1, NULL, &fdset, NULL, &tv) == 1)
+    {
+        int so_error;
+        socklen_t len = sizeof so_error;
+
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+
+        if (so_error == 0) {
+            close(sock);
+            return 0;
+        }
+    }
+
+    close(sock);
+    return -1;
+
+    return 0;
+}
+
+int scanIp(int ip1, int ip2, int ip3, int ip4, int port) {
+    char address[17];
+    char p[4];
+    address[0] = '\0';
+    sprintf(p, "%d", ip1);
+    strcat(address, p);
+    strcat(address, ".");
+    sprintf(p, "%d", ip2);
+    strcat(address, p);
+    strcat(address, ".");
+    sprintf(p, "%d", ip3);
+    strcat(address, p);
+    strcat(address, ".");
+    sprintf(p, "%d", ip4);
+    strcat(address, p);
+
+    printf("    knocking %s:%d\n", address, port);
+
+    int result = connectAttempt(address, port);
+
+    if (result > -1) {
+        printf("    successfully connect to %s:%d\n", address, port);
+    }
+    return result;
 }
 
 void *scannerThread() {
+    int ip1, ip2, ip3, ip4, port;
     while (running == 1) {
         int status = pthread_mutex_trylock(&lock);
 
+        // this way scan doesn't cause lock to hold up
+        ip1 = buffer->ip1;
+        ip2 = buffer->ip2;
+        ip3 = buffer->ip3;
+        ip4 = buffer->ip4;
+        port = buffer->port;
+
         if (status != EBUSY) {
-            scanIp(buffer->ip1, buffer->ip2, buffer->ip3, buffer->ip4, buffer->port);
             buffer->ip4 += 1;
             if (buffer->ip4 > 255) {
                 buffer->ip4 = 1;
@@ -69,6 +140,8 @@ void *scannerThread() {
             }
 
             status = pthread_mutex_unlock(&lock);
+            scanIp(ip1, ip2, ip3, ip4, port);
+
         }
     }
 }
@@ -146,28 +219,19 @@ int main(int count, char *arguments[]) {
     running = 1;
 
     pthread_t parent_thread;
-    pthread_t scan_thread_1, scan_thread_2, scan_thread_3, scan_thread_4;
+    pthread_t scan_threads[100];
 
     pthread_mutex_init(&lock, 0);
 
     if (pthread_create(&parent_thread, NULL, parentThread, NULL)) {
         printf("OOOF creating parent thread failed\n");
+        return -1;
     }
 
-    if (pthread_create(&scan_thread_1, NULL, scannerThread, NULL)) {
-        printf("OOOF creating scanner1 thread failed\n");
-    }
-
-    if (pthread_create(&scan_thread_2, NULL, scannerThread, NULL)) {
-        printf("OOOF creating scanner2 thread failed\n");
-    }
-
-    if (pthread_create(&scan_thread_3, NULL, scannerThread, NULL)) {
-        printf("OOOF creating scanner3 thread failed\n");
-    }
-
-    if (pthread_create(&scan_thread_4, NULL, scannerThread, NULL)) {
-        printf("OOOF creating scanner4 thread failed\n");
+    for (int i = 0; i < 100; i += 1) {
+        if (pthread_create(&scan_threads[i], NULL, scannerThread, NULL)) {
+            printf("OOOF creating scan thread failed [%i]\n", i);
+        }
     }
 
     if (pthread_join(parent_thread, NULL)) {
@@ -175,24 +239,10 @@ int main(int count, char *arguments[]) {
         return -1;
     }
 
-    if (pthread_join(scan_thread_1, NULL)) {
-        printf("OOOF joining scanner1 thread failed\n");
-        return -1;
-    }
-
-    if (pthread_join(scan_thread_2, NULL)) {
-        printf("OOOF joining scanner1 thread failed\n");
-        return -1;
-    }
-
-    if (pthread_join(scan_thread_3, NULL)) {
-        printf("OOOF joining scanner1 thread failed\n");
-        return -1;
-    }
-
-    if (pthread_join(scan_thread_4, NULL)) {
-        printf("OOOF joining scanner1 thread failed\n");
-        return -1;
+    for (int i = 0; i < 100; i += 1) {
+        if (pthread_join(scan_threads[i], NULL)) {
+            printf("OOOF joining scan thread failed [%i]\n", i);
+        }
     }
 
     printf("Scan complete or cancelled\n");
